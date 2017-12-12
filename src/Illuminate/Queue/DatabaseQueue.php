@@ -2,6 +2,7 @@
 
 namespace Illuminate\Queue;
 
+use Illuminate\Database\Query\Expression;
 use Illuminate\Support\Carbon;
 use Illuminate\Database\Connection;
 use Illuminate\Queue\Jobs\DatabaseJob;
@@ -176,6 +177,7 @@ class DatabaseQueue extends Queue implements QueueContract
             'available_at' => $availableAt,
             'created_at' => $this->currentTime(),
             'payload' => $payload,
+            'version' => 0
         ];
     }
 
@@ -189,13 +191,31 @@ class DatabaseQueue extends Queue implements QueueContract
     {
         $queue = $this->getQueue($queue);
 
-        $this->database->beginTransaction();
+        // Pops one job of the queue or return null if there is no job to process.
+        //
+        // In order to preserve job ordering we have to pick the first available job.
+        // Workers compete for the first available job in the queue.
+        //
+        // Load the first available job and try to claim it.
+        // During the competition it may happen another worker claims the job before we do
+        // which can be easily handled and detected with optimistic locking.
+        //
+        // In that case we try to load another job
+        // because there are apparently some more jobs in the database and pop() is supposed
+        // to return such job if there is one or return null if there are no jobs so worker
+        // can sleep(). Thus we have to attempt to claim jobs until there are some.
+        $job = null;
+        do {
+            if ($job = $this->getNextAvailableJob($queue)) {
 
-        if ($job = $this->getNextAvailableJob($queue)) {
-            return $this->marshalJob($queue, $job);
-        }
-
-        $this->database->commit();
+                // job is not null, try to claim it
+                $jobClaimed = $this->marshalJob($queue, $job);
+                if (!empty($jobClaimed)) {
+                    // job was successfully claimed, return it.
+                    return $jobClaimed;
+                }
+            }
+        } while($job);
     }
 
     /**
@@ -207,7 +227,6 @@ class DatabaseQueue extends Queue implements QueueContract
     protected function getNextAvailableJob($queue)
     {
         $job = $this->database->table($this->table)
-                    ->lockForUpdate()
                     ->where('queue', $this->getQueue($queue))
                     ->where(function ($query) {
                         $this->isAvailable($query);
@@ -258,8 +277,9 @@ class DatabaseQueue extends Queue implements QueueContract
     protected function marshalJob($queue, $job)
     {
         $job = $this->markJobAsReserved($job);
-
-        $this->database->commit();
+        if (empty($job)){
+            return null;
+        }
 
         return new DatabaseJob(
             $this->container, $this, $job, $this->connectionName, $queue
@@ -274,12 +294,16 @@ class DatabaseQueue extends Queue implements QueueContract
      */
     protected function markJobAsReserved($job)
     {
-        $this->database->table($this->table)->where('id', $job->id)->update([
+        $affected = $this->database->table($this->table)
+            ->where('id', $job->id)
+            ->where('version', $job->version)
+            ->update([
             'reserved_at' => $job->touch(),
             'attempts' => $job->increment(),
+            'version' => new Expression('version + 1'),
         ]);
 
-        return $job;
+        return $affected ? $job : null;
     }
 
     /**
@@ -291,13 +315,13 @@ class DatabaseQueue extends Queue implements QueueContract
      */
     public function deleteReserved($queue, $id)
     {
-        $this->database->beginTransaction();
-
-        if ($this->database->table($this->table)->lockForUpdate()->find($id)) {
-            $this->database->table($this->table)->where('id', $id)->delete();
+        $job = $this->database->table($this->table)->find($id);
+        if ($job){
+            $this->database->table($this->table)
+                ->where('id', $id)
+                ->where('version', $job->version)
+                ->delete();
         }
-
-        $this->database->commit();
     }
 
     /**
