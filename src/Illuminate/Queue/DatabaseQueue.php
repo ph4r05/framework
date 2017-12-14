@@ -216,6 +216,7 @@ class DatabaseQueue extends Queue implements QueueContract
                 }
             }
         } while($job);
+        return null;
     }
 
     /**
